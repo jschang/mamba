@@ -24,10 +24,8 @@ from torch.utils.cpp_extension import (
     CUDA_HOME,
 )
 
-
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
-
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +68,23 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
+def get_hip_version(rocm_dir) -> str:
+    hipcc_bin = "hipcc" if rocm_dir is None else os.path.join(rocm_dir, "bin", "hipcc")
+    try:
+        raw_output = subprocess.check_output(
+            [hipcc_bin, "--version"], universal_newlines=True
+        )
+    except Exception as e:
+        print(
+            f"hip installation not found: {e} ROCM_PATH={os.environ.get('ROCM_PATH')}"
+        )
+        return None
+    for line in raw_output.split("\n"):
+        if "HIP version" in line:
+            return line.split()[-1]
+    return None
+
+
 def check_if_cuda_home_none(global_option: str) -> None:
     if CUDA_HOME is not None:
         return
@@ -84,88 +99,6 @@ def check_if_cuda_home_none(global_option: str) -> None:
 
 def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", "4"]
-
-
-cmdclass = {}
-ext_modules = []
-
-if not SKIP_CUDA_BUILD:
-    print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
-    TORCH_MAJOR = int(torch.__version__.split(".")[0])
-    TORCH_MINOR = int(torch.__version__.split(".")[1])
-
-    check_if_cuda_home_none(PACKAGE_NAME)
-    # Check, if CUDA11 is installed for compute capability 8.0
-    cc_flag = []
-    if CUDA_HOME is not None:
-        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-        if bare_metal_version < Version("11.6"):
-            raise RuntimeError(
-                f"{PACKAGE_NAME} is only supported on CUDA 11.6 and above.  "
-                "Note: make sure nvcc has a supported version by running nvcc -V."
-            )
-            
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_53,code=sm_53")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_62,code=sm_62")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_70,code=sm_70")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_72,code=sm_72")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_80,code=sm_80")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_87,code=sm_87")
-    if bare_metal_version >= Version("11.8"):
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_90,code=sm_90")
-
-    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
-    # torch._C._GLIBCXX_USE_CXX11_ABI
-    # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
-    if FORCE_CXX11_ABI:
-        torch._C._GLIBCXX_USE_CXX11_ABI = True
-
-    ext_modules.append(
-        CUDAExtension(
-            name="selective_scan_cuda",
-            sources=[
-                "csrc/selective_scan/selective_scan.cpp",
-                "csrc/selective_scan/selective_scan_fwd_fp32.cu",
-                "csrc/selective_scan/selective_scan_fwd_fp16.cu",
-                "csrc/selective_scan/selective_scan_fwd_bf16.cu",
-                "csrc/selective_scan/selective_scan_bwd_fp32_real.cu",
-                "csrc/selective_scan/selective_scan_bwd_fp32_complex.cu",
-                "csrc/selective_scan/selective_scan_bwd_fp16_real.cu",
-                "csrc/selective_scan/selective_scan_bwd_fp16_complex.cu",
-                "csrc/selective_scan/selective_scan_bwd_bf16_real.cu",
-                "csrc/selective_scan/selective_scan_bwd_bf16_complex.cu",
-            ],
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": append_nvcc_threads(
-                    [
-                        "-O3",
-                        "-std=c++17",
-                        "-U__CUDA_NO_HALF_OPERATORS__",
-                        "-U__CUDA_NO_HALF_CONVERSIONS__",
-                        "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                        "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-                        "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-                        "--expt-relaxed-constexpr",
-                        "--expt-extended-lambda",
-                        "--use_fast_math",
-                        "--ptxas-options=-v",
-                        "-lineinfo",
-                    ]
-                    + cc_flag
-                ),
-            },
-            include_dirs=[Path(this_dir) / "csrc" / "selective_scan"],
-        )
-    )
 
 
 def get_package_version():
@@ -239,46 +172,207 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 
-setup(
-    name=PACKAGE_NAME,
-    version=get_package_version(),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-            "mamba_ssm.egg-info",
+def get_extensions():
+    ext_modules = []
+    ext_meta = {}
+    include_dirs = [Path(this_dir) / "csrc" / "selective_scan"]
+    sources = [
+        "csrc/selective_scan/selective_scan.cpp",
+        "csrc/selective_scan/selective_scan_fwd_fp32.cu",
+        "csrc/selective_scan/selective_scan_fwd_fp16.cu",
+        "csrc/selective_scan/selective_scan_fwd_bf16.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp32_real.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp32_complex.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp16_real.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp16_complex.cu",
+        "csrc/selective_scan/selective_scan_bwd_bf16_real.cu",
+        "csrc/selective_scan/selective_scan_bwd_bf16_complex.cu",
+    ]
+    if (
+            (torch.cuda.is_available() and ((CUDA_HOME is not None)))
+            or os.getenv("FORCE_CUDA", "0") == "1"
+            or os.getenv("TORCH_CUDA_ARCH_LIST", "") != ""
+    ) and not SKIP_CUDA_BUILD:
+        print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
+        TORCH_MAJOR = int(torch.__version__.split(".")[0])
+        TORCH_MINOR = int(torch.__version__.split(".")[1])
+
+        check_if_cuda_home_none(PACKAGE_NAME)
+        # Check, if CUDA11 is installed for compute capability 8.0
+        cc_flag = []
+        if CUDA_HOME is not None:
+            _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+            if bare_metal_version < Version("11.6"):
+                raise RuntimeError(
+                    f"{PACKAGE_NAME} is only supported on CUDA 11.6 and above.  "
+                    "Note: make sure nvcc has a supported version by running nvcc -V."
+                )
+
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_53,code=sm_53")
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_62,code=sm_62")
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_70,code=sm_70")
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_72,code=sm_72")
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_80,code=sm_80")
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_87,code=sm_87")
+        if bare_metal_version >= Version("11.8"):
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_90,code=sm_90")
+
+        # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+        # torch._C._GLIBCXX_USE_CXX11_ABI
+        # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
+        if FORCE_CXX11_ABI:
+            torch._C._GLIBCXX_USE_CXX11_ABI = True
+
+        ext_modules.append(
+            CUDAExtension(
+                name="selective_scan_cuda",
+                sources=sources,
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++17"],
+                    "nvcc": append_nvcc_threads(
+                        [
+                            "-O3",
+                            "-std=c++17",
+                            "-U__CUDA_NO_HALF_OPERATORS__",
+                            "-U__CUDA_NO_HALF_CONVERSIONS__",
+                            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+                            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                            "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+                            "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+                            "--expt-relaxed-constexpr",
+                            "--expt-extended-lambda",
+                            "--use_fast_math",
+                            "--ptxas-options=-v",
+                            "-lineinfo",
+                        ]
+                        + cc_flag
+                    ),
+                },
+                include_dirs=include_dirs,
+            )
         )
-    ),
-    author="Tri Dao, Albert Gu",
-    author_email="tri@tridao.me, agu@cs.cmu.edu",
-    description="Mamba state-space model",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/state-spaces/mamba",
-    classifiers=[
-        "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: BSD License",
-        "Operating System :: Unix",
-    ],
-    ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": BuildExtension}
-    if ext_modules
-    else {
-        "bdist_wheel": CachedWheelsCommand,
-    },
-    python_requires=">=3.7",
-    install_requires=[
-        "torch",
-        "packaging",
-        "ninja",
-        "einops",
-        "triton",
-        "transformers",
-        # "causal_conv1d>=1.2.0",
-    ],
-)
+
+    elif torch.cuda.is_available() and torch.version.hip:
+
+        rename_cpp_cu(source_hip)
+        rocm_home = os.getenv("ROCM_PATH")
+        hip_version = get_hip_version(rocm_home)
+
+        extension = CUDAExtension
+        generator_flag = []
+        cc_flag = ["-DBUILD_PYTHON_PACKAGE"]
+        extra_compile_args = {
+            "cxx": ["-O3", "-std=c++17"] + generator_flag,
+            "nvcc": [
+                        "-O3",
+                        "-std=c++17",
+                        f"--offload-arch={os.getenv('HIP_ARCHITECTURES', 'native')}",
+                        "-U__CUDA_NO_HALF_OPERATORS__",
+                        "-U__CUDA_NO_HALF_CONVERSIONS__",
+                        "-DCK_FMHA_FWD_FAST_EXP2=1",
+                        "-fgpu-flush-denormals-to-zero",
+                        "-Werror",
+                        "-Woverloaded-virtual",
+                    ]
+                    + generator_flag
+                    + cc_flag,
+        }
+        ext_modules.append(
+            extension(
+                "mamba._C",
+                sorted(sources),
+                include_dirs=[os.path.abspath(p) for p in include_dirs],
+                define_macros=define_macros,
+                extra_compile_args=extra_compile_args,
+            )
+        )
+        ext_meta = {
+            "version": {
+                "cuda": cuda_version,
+                "hip": hip_version,
+                "torch": torch.__version__,
+                "python": platform.python_version(),
+                "flash": flash_version,
+            },
+            "env": {
+                k: os.environ.get(k)
+                for k in [
+                    "TORCH_CUDA_ARCH_LIST",
+                    "PYTORCH_ROCM_ARCH",
+                    "NVCC_FLAGS",
+                ]
+            },
+        }
+    return ext_modules, ext_meta
+
+
+def generate_version_py(version: str) -> str:
+    content = "# noqa: C801\n"
+    content += f'__version__ = "{version}"\n'
+    tag = os.getenv("GIT_TAG")
+    if tag is not None:
+        content += f'git_tag = "{tag}"\n'
+    return content
+
+
+if __name__ == "__main__":
+    extensions, extensions_metadata = get_extensions()
+    setup(
+        name=PACKAGE_NAME,
+        version=get_package_version(),
+        packages=find_packages(
+            exclude=(
+                "build",
+                "csrc",
+                "include",
+                "tests",
+                "dist",
+                "docs",
+                "benchmarks",
+                "mamba_ssm.egg-info",
+            )
+        ),
+        author="Tri Dao, Albert Gu",
+        author_email="tri@tridao.me, agu@cs.cmu.edu",
+        description="Mamba state-space model",
+        long_description=long_description,
+        long_description_content_type="text/markdown",
+        url="https://github.com/state-spaces/mamba",
+        classifiers=[
+            "Programming Language :: Python :: 3",
+            "License :: OSI Approved :: BSD License",
+            "Operating System :: Unix",
+        ],
+        ext_modules=ext_modules,
+        cmdclass={
+            "bdist_wheel": CachedWheelsCommand,
+            "build_ext": BuildExtensionWithExtraFiles.with_options(
+                no_python_abi_suffix=True,
+                extra_files={
+                    "cpp_lib.json": json.dumps(extensions_metadata),
+                    "version.py": generate_version_py(get_package_version())
+                }
+            )
+        }
+        if ext_modules
+        else {
+            "bdist_wheel": CachedWheelsCommand,
+        },
+        python_requires=">=3.7",
+        install_requires=[
+            "torch",
+            "packaging",
+            "ninja",
+            "einops",
+            "triton",
+            "transformers",
+            # "causal_conv1d>=1.2.0",
+        ],
+    )
